@@ -32,7 +32,7 @@ async def get_contracts(params: ContractsParams | None = None) -> list[dict]:
     elif params.status == "ended":
         url += "?status=closed"
 
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
 
     contracts = []
 
@@ -121,7 +121,7 @@ async def get_contract_details(contract_url: str) -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    await page.goto(contract_url, wait_until="networkidle")
+    await page.goto(contract_url, wait_until="domcontentloaded")
 
     details = {"url": contract_url}
 
@@ -230,7 +230,7 @@ async def get_work_diary(contract_url: str, week_offset: int = 0) -> dict:
     # Navigate to work diary
     # The exact URL structure may vary
     diary_url = contract_url.replace("/contracts/", "/work-diary/")
-    await page.goto(diary_url, wait_until="networkidle")
+    await page.goto(diary_url, wait_until="domcontentloaded")
 
     diary = {"contract_url": contract_url, "days": []}
 

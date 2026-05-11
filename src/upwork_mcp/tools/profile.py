@@ -13,7 +13,7 @@ async def get_my_profile() -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    await page.goto("https://www.upwork.com/freelancers/settings/profile", wait_until="networkidle")
+    await page.goto("https://www.upwork.com/freelancers/settings/profile", wait_until="domcontentloaded")
 
     profile = {}
 
@@ -46,7 +46,7 @@ async def get_my_profile() -> dict:
             profile["skills"].append(text.strip())
 
     # Now get stats from a different page
-    await page.goto("https://www.upwork.com/nx/find-work/best-matches", wait_until="networkidle")
+    await page.goto("https://www.upwork.com/nx/find-work/best-matches", wait_until="domcontentloaded")
 
     # Try to get JSS from sidebar or header
     jss_el = await page.query_selector('[data-test="jss"], .jss-score, [data-cy="jss"]')
@@ -81,7 +81,7 @@ async def get_connects_balance() -> dict:
     page = await browser.get_page()
 
     # Navigate to connects page
-    await page.goto("https://www.upwork.com/nx/plans/connects/balance", wait_until="networkidle")
+    await page.goto("https://www.upwork.com/nx/plans/connects/balance", wait_until="domcontentloaded")
 
     connects = {}
 
@@ -97,7 +97,7 @@ async def get_connects_balance() -> dict:
 
     # If we couldn't find it, try the header/sidebar on main page
     if "available" not in connects:
-        await page.goto("https://www.upwork.com/nx/find-work/", wait_until="networkidle")
+        await page.goto("https://www.upwork.com/nx/find-work/", wait_until="domcontentloaded")
         connects_el = await page.query_selector('[data-test="connects-count"], .connects-count')
         if connects_el:
             text = (await connects_el.text_content() or "").strip()
@@ -128,7 +128,7 @@ async def get_profile_stats() -> dict:
     page = await browser.get_page()
 
     # Navigate to work diary or stats page
-    await page.goto("https://www.upwork.com/nx/wm/contracts", wait_until="networkidle")
+    await page.goto("https://www.upwork.com/nx/wm/contracts", wait_until="domcontentloaded")
 
     stats = {}
 

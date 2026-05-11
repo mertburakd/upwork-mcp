@@ -31,7 +31,7 @@ async def get_messages(params: MessagesParams) -> list[dict]:
     if params.unread_only:
         url += "?filter=unread"
 
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
 
     conversations = []
 
@@ -118,7 +118,7 @@ async def get_conversation_messages(room_id: str, limit: int = 50) -> dict:
     else:
         url = f"https://www.upwork.com/nx/messages/{room_id}"
 
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
 
     conversation = {"room_id": room_id, "messages": []}
 
@@ -204,7 +204,7 @@ async def send_message(params: SendMessageParams) -> dict:
     else:
         url = f"https://www.upwork.com/nx/messages/{params.room_id}"
 
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
 
     # Find message input
     input_el = await page.query_selector('[data-test="message-input"], textarea[name*="message"], .message-input textarea')
@@ -244,7 +244,7 @@ async def get_unread_count() -> dict:
     page = await browser.get_page()
 
     # Check messages badge in header
-    await page.goto("https://www.upwork.com/nx/find-work/", wait_until="networkidle")
+    await page.goto("https://www.upwork.com/nx/find-work/", wait_until="domcontentloaded")
 
     unread_el = await page.query_selector('[data-test="messages-badge"], .messages-count, .unread-count')
     if unread_el:

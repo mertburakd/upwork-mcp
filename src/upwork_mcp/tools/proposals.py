@@ -40,7 +40,7 @@ async def get_proposals(params: ProposalsParams) -> list[dict]:
     }.get(params.status.lower(), "active")
 
     url = f"https://www.upwork.com/nx/proposals/{'?status=' + status_path if status_path else ''}"
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
 
     proposals = []
 
@@ -128,7 +128,7 @@ async def get_proposal_details(proposal_url: str) -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    await page.goto(proposal_url, wait_until="networkidle")
+    await page.goto(proposal_url, wait_until="domcontentloaded")
 
     details = {"url": proposal_url}
 
@@ -177,7 +177,7 @@ async def submit_proposal(params: SubmitProposalParams) -> dict:
     page = await browser.get_page()
 
     # Navigate to job page first
-    await page.goto(params.job_url, wait_until="networkidle")
+    await page.goto(params.job_url, wait_until="domcontentloaded")
 
     # Click apply button
     apply_btn = await page.query_selector('[data-test="apply-button"], button:has-text("Apply Now")')
@@ -185,7 +185,7 @@ async def submit_proposal(params: SubmitProposalParams) -> dict:
         return {"status": "error", "message": "Apply button not found. Job may be closed or unavailable."}
 
     await apply_btn.click()
-    await page.wait_for_load_state("networkidle")
+    await page.wait_for_load_state("domcontentloaded")
 
     # Fill in rate/bid
     if params.rate:
@@ -257,7 +257,7 @@ async def withdraw_proposal(proposal_url: str) -> dict:
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    await page.goto(proposal_url, wait_until="networkidle")
+    await page.goto(proposal_url, wait_until="domcontentloaded")
 
     # Find withdraw button
     withdraw_btn = await page.query_selector('[data-test="withdraw-button"], button:has-text("Withdraw")')

@@ -48,7 +48,7 @@ async def search_jobs(params: JobSearchParams) -> list[dict]:
             query_params["contractor_tier"] = level
 
     url = f"{base_url}?{urllib.parse.urlencode(query_params)}"
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
     await asyncio.sleep(3)
 
     jobs = []
@@ -135,7 +135,7 @@ async def get_job_details(params: JobDetailsParams) -> dict:
     if not url.startswith("http"):
         url = f"https://www.upwork.com/jobs/{url}"
 
-    await page.goto(url, wait_until="networkidle")
+    await page.goto(url, wait_until="domcontentloaded")
     await asyncio.sleep(3)
 
     job = {"url": url}
