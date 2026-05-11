@@ -136,77 +136,273 @@ async def get_job_details(params: JobDetailsParams) -> dict:
         url = f"https://www.upwork.com/jobs/{url}"
 
     await page.goto(url, wait_until="domcontentloaded")
-    await asyncio.sleep(3)
+
+    # Wait for the main job-detail container to actually render — Upwork
+    # populates the SSR'd shell asynchronously. Fall back to a short sleep
+    # if the selector never appears so we still return partial data.
+    try:
+        await page.wait_for_selector(
+            '[data-test="Description"], [data-test="about-client-container"]',
+            timeout=15000,
+        )
+    except Exception:
+        await asyncio.sleep(3)
 
     job = {"url": url}
 
-    # Title
-    title_el = await page.query_selector("h1, h2")
+    # Title — Upwork uses <h4> for the job title, not h1/h2. Fall back to
+    # the document <title> if the h4 isn't found.
+    title_el = await page.query_selector(
+        'h4 .flex-1, h4 span.flex-1, h1, h2, h3'
+    )
     if title_el:
         job["title"] = (await title_el.text_content() or "").strip()
+    if not job.get("title"):
+        page_title = (await page.title() or "").strip()
+        # Strip " - Upwork" / " - Web Development" suffixes
+        job["title"] = re.sub(r"\s*[-—]\s*(Upwork|Web Development).*$", "", page_title).strip()
 
-    # Full description
-    desc_el = await page.query_selector("[data-test='description'], .description, article p")
+    # Posted time
+    posted_el = await page.query_selector(".posted-on-line")
+    if posted_el:
+        posted_text = (await posted_el.text_content() or "").strip()
+        posted_text = re.sub(r"\s+", " ", posted_text)
+        if posted_text:
+            job["posted"] = posted_text
+
+    # Full description — case-sensitive attribute selector matters here.
+    desc_el = await page.query_selector('[data-test="Description"]')
     if desc_el:
-        job["description"] = (await desc_el.text_content() or "").strip()
+        # The element wraps "Summary" <strong> + the body <p>. Prefer the <p>.
+        body_p = await desc_el.query_selector("p")
+        if body_p:
+            text = (await body_p.text_content() or "").strip()
+        else:
+            text = (await desc_el.text_content() or "").strip()
+        # Collapse whitespace
+        text = re.sub(r"\s+", " ", text)
+        if text:
+            job["description"] = text
 
-    # Get all text blocks to find budget, experience, etc.
-    all_text = await page.query_selector_all("p, span, div")
-    for el in all_text:
-        text = await el.text_content()
-        if not text:
+    # Job features (Hourly/Fixed, weekly hours, duration, experience level,
+    # project type). Each <li> has a <strong> headline + <div class="description">
+    # label describing what the headline means.
+    features = {}
+    feature_items = await page.query_selector_all("ul.features > li, .features li")
+    for li in feature_items:
+        strong = await li.query_selector("strong")
+        desc = await li.query_selector(".description")
+        if not strong or not desc:
             continue
-        text = text.strip()
+        value = (await strong.text_content() or "").strip()
+        label = (await desc.text_content() or "").strip()
+        value = re.sub(r"\s+", " ", value)
+        label = re.sub(r"\s+", " ", label)
+        if not value or not label:
+            continue
+        low = label.lower()
+        if "hourly" in low or "fixed" in low:
+            features["job_type"] = label  # "Hourly" / "Fixed-price"
+            features["workload"] = value  # e.g. "Less than 30 hrs/week"
+        elif "duration" in low:
+            features["duration"] = value
+        elif "experience level" in low or "experience" in low:
+            features["experience_level"] = value
+        elif "$" in value:
+            features["budget"] = value
+        else:
+            # Generic feature — keep first word of label as key
+            key = label.split()[0].lower()
+            features[key] = value
+    if features:
+        job.update(features)
 
-        # Budget
-        if "$" in text and len(text) < 50 and not job.get("budget"):
-            job["budget"] = text
+    # Project type (One-time / Ongoing) — separate "segmentations" list
+    seg_items = await page.query_selector_all(".segmentations li")
+    for li in seg_items:
+        text = (await li.text_content() or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if "Project Type:" in text:
+            job["project_type"] = text.replace("Project Type:", "").strip()
 
-        # Experience level
-        if any(x in text.lower() for x in ["entry level", "intermediate", "expert"]):
-            if not job.get("experience_level"):
-                job["experience_level"] = text
-
-        # Project length
-        if any(x in text.lower() for x in ["less than", "1 to 3", "3 to 6", "more than"]):
-            if "month" in text.lower() and not job.get("project_length"):
-                job["project_length"] = text
-
-    # Skills
-    skill_els = await page.query_selector_all("[class*='skill'], [class*='token'], button")
+    # Skills — only real skill badges, not navigation buttons.
+    skill_els = await page.query_selector_all(
+        'a.air3-badge[href*="ontology_skill_uid"], a.up-skill-badge'
+    )
     skills = []
-    for el in skill_els[:15]:
-        text = await el.text_content()
-        if text and 2 < len(text.strip()) < 30:
-            skills.append(text.strip())
+    for el in skill_els:
+        text = (await el.text_content() or "").strip()
+        text = re.sub(r"\s+", " ", text)
+        if text and text not in skills:
+            skills.append(text)
     if skills:
-        job["skills"] = list(set(skills))[:10]
+        job["skills"] = skills
 
-    # Client info
-    client = {}
-    client_section = await page.query_selector("[data-test='client-info'], [class*='client']")
-    if client_section:
-        client_text = await client_section.text_content()
-        if client_text:
-            # Look for location, rating, etc.
-            if "Payment" in client_text and "verified" in client_text.lower():
-                client["payment_verified"] = True
-            # Extract spending info
-            spent_match = re.search(r"\$[\d,]+[KMB]?\+?\s*(spent|total)", client_text, re.I)
+    # Activity on this job (proposals, interviewing, invites sent, etc.)
+    activity = {}
+    activity_items = await page.query_selector_all(".client-activity-items .ca-item")
+    for li in activity_items:
+        title_el2 = await li.query_selector(".title")
+        value_el = await li.query_selector(".value")
+        if not title_el2 or not value_el:
+            continue
+        k = (await title_el2.text_content() or "").strip().rstrip(":").lower()
+        v = (await value_el.text_content() or "").strip()
+        k = re.sub(r"\s+", "_", k)
+        v = re.sub(r"\s+", " ", v)
+        if k and v:
+            activity[k] = v
+    if activity:
+        job["activity"] = activity
+
+    # Bid range ("Bid range - High $70.00 | Avg $42.73 | Low $30.00")
+    # Lives in its own section near the activity list.
+    page_text_for_bid = await page.content()
+    bid_match = re.search(
+        r"Bid range\s*[-–—]\s*High\s*(\$[\d.,]+)\s*\|\s*Avg\s*(\$[\d.,]+)\s*\|\s*Low\s*(\$[\d.,]+)",
+        page_text_for_bid,
+    )
+    if bid_match:
+        job["bid_range"] = {
+            "high": bid_match.group(1),
+            "avg": bid_match.group(2),
+            "low": bid_match.group(3),
+        }
+
+    # Client info — the "About the client" sidebar block.
+    client_el = await page.query_selector('[data-test="about-client-container"]')
+    if client_el:
+        client = {}
+        client_text = (await client_el.text_content() or "")
+
+        # Payment verification status (positive or negative phrasing)
+        if re.search(r"Payment method (verified|not verified)", client_text, re.I):
+            client["payment_verified"] = "not verified" not in client_text.lower()
+        # Phone verified
+        if "phone number verified" in client_text.lower():
+            client["phone_verified"] = True
+        # Rating like "4.85 of N reviews" / "5.00"
+        rating_match = re.search(r"\b([0-5]\.\d{1,2})\b\s*(of|out of)?\s*(\d+)?\s*(reviews?|rating)?", client_text, re.I)
+        if rating_match:
+            client["rating"] = rating_match.group(1)
+
+        # Location
+        loc_el = await client_el.query_selector('[data-qa="client-location"]')
+        if loc_el:
+            country_el = await loc_el.query_selector("strong")
+            if country_el:
+                client["country"] = (await country_el.text_content() or "").strip()
+            city_spans = await loc_el.query_selector_all("span.nowrap")
+            if city_spans:
+                client["city"] = (await city_spans[0].text_content() or "").strip()
+
+        # Job posting stats — "1 job posted" + "0% hire rate, 1 open job"
+        stats_el = await client_el.query_selector('[data-qa="client-job-posting-stats"]')
+        if stats_el:
+            stats_text = (await stats_el.text_content() or "").strip()
+            stats_text = re.sub(r"\s+", " ", stats_text)
+            client["job_posting_stats"] = stats_text
+            jobs_posted_match = re.search(r"(\d+)\s+job", stats_text)
+            if jobs_posted_match:
+                client["jobs_posted"] = int(jobs_posted_match.group(1))
+            hire_match = re.search(r"(\d+)%\s*hire rate", stats_text)
+            if hire_match:
+                client["hire_rate_pct"] = int(hire_match.group(1))
+
+        # Total spent — clients with history have a dedicated <strong data-qa="client-spend">.
+        spend_el = await client_el.query_selector('[data-qa="client-spend"]')
+        if spend_el:
+            spend_text = (await spend_el.text_content() or "").strip()
+            spend_text = re.sub(r"\s+", " ", spend_text)
+            client["total_spent"] = spend_text  # e.g. "$14K total spent"
+            spend_amt = re.search(r"\$[\d.,]+[KMB]?\+?", spend_text)
+            if spend_amt:
+                client["total_spent_amount"] = spend_amt.group(0)
+        else:
+            # Fallback: regex over the whole client text
+            spent_match = re.search(r"\$[\d.,]+[KMB]?\+?\s*(spent|total spent)", client_text, re.I)
             if spent_match:
-                client["total_spent"] = spent_match.group(0)
+                client["total_spent"] = spent_match.group(0).strip()
 
-    if client:
-        job["client"] = client
+        # Hires — "20 hires, 9 active" sits in a sibling <div> of client-spend.
+        hires_el = await client_el.query_selector('[data-qa="client-hires"]')
+        if hires_el:
+            hires_text = (await hires_el.text_content() or "").strip()
+            hires_text = re.sub(r"\s+", " ", hires_text)
+            client["hires"] = hires_text  # raw text
+            total_hires = re.search(r"(\d+)\s+hires?", hires_text, re.I)
+            if total_hires:
+                client["hires_total"] = int(total_hires.group(1))
+            active_hires = re.search(r"(\d+)\s+active", hires_text, re.I)
+            if active_hires:
+                client["hires_active"] = int(active_hires.group(1))
 
-    # Connects required
-    connects_els = await page.query_selector_all("span, div")
-    for el in connects_els:
-        text = await el.text_content()
-        if text and "connect" in text.lower():
-            numbers = re.findall(r"\d+", text)
-            if numbers:
-                job["connects_required"] = int(numbers[0])
-                break
+        # Avg hourly rate paid by this client — critical signal for the freelancer
+        rate_el = await client_el.query_selector('[data-qa="client-hourly-rate"]')
+        if rate_el:
+            rate_text = (await rate_el.text_content() or "").strip()
+            rate_text = re.sub(r"\s+", " ", rate_text)
+            client["avg_hourly_rate_paid"] = rate_text  # e.g. "$9.19 /hr avg hourly rate paid"
+            rate_match = re.search(r"\$([\d.,]+)\s*/?\s*hr", rate_text, re.I)
+            if rate_match:
+                try:
+                    client["avg_hourly_rate_paid_amount"] = float(rate_match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+
+        # Total hours billed — "1,112 hours"
+        hours_el = await client_el.query_selector('[data-qa="client-hours"]')
+        if hours_el:
+            hours_text = (await hours_el.text_content() or "").strip()
+            hours_text = re.sub(r"\s+", " ", hours_text)
+            client["total_hours_billed"] = hours_text
+            hours_match = re.search(r"([\d.,]+)\s*hours", hours_text, re.I)
+            if hours_match:
+                try:
+                    client["total_hours_billed_amount"] = int(hours_match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
+
+        # Member since
+        contract_el = await client_el.query_selector('[data-qa="client-contract-date"]')
+        if contract_el:
+            text = (await contract_el.text_content() or "").strip()
+            client["member_since"] = text.replace("Member since", "").strip()
+
+        # Company / industry / size
+        company_el = await client_el.query_selector('[data-qa="client-company-profile"]')
+        if company_el:
+            company_text = (await company_el.text_content() or "").strip()
+            company_text = re.sub(r"\s+", " ", company_text)
+            if company_text:
+                client["company"] = company_text
+
+        if client:
+            job["client"] = client
+
+    # Connects required ("Send a proposal for: 8 Connects")
+    # Use locator with has-text so we don't grab the "Available Connects" line.
+    try:
+        req_loc = page.locator("text=Send a proposal for").first
+        if await req_loc.count() > 0:
+            req_text = await req_loc.text_content()
+            if req_text:
+                m = re.search(r"(\d+)\s*Connects?", req_text)
+                if m:
+                    job["connects_required"] = int(m.group(1))
+    except Exception:
+        pass
+
+    # Available connects
+    try:
+        avail_loc = page.locator("text=Available Connects").first
+        if await avail_loc.count() > 0:
+            avail_text = await avail_loc.text_content()
+            if avail_text:
+                m = re.search(r"(\d+)", avail_text)
+                if m:
+                    job["available_connects"] = int(m.group(1))
+    except Exception:
+        pass
 
     return job
