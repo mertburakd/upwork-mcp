@@ -10,13 +10,83 @@ from ..browser.client import get_browser
 class JobSearchParams(BaseModel):
     """Parameters for job search."""
     query: str = Field(description="Search keywords")
-    experience_level: str | None = Field(
+    category: str | None = Field(default=None, description="Job category filter")
+    budget_min: int | None = Field(default=None, description="Minimum budget in USD")
+    budget_max: int | None = Field(default=None, description="Maximum budget in USD")
+    experience_level: list[str] | str | None = Field(
         default=None,
-        description="Experience level: entry, intermediate, or expert"
+        description=(
+            "Experience level filter. Accepts a single value or a list. "
+            "Allowed: 'entry', 'intermediate', 'expert'."
+        ),
     )
     job_type: str | None = Field(
         default=None,
-        description="Job type: hourly or fixed"
+        description="Job type: hourly or fixed (omit to include both)",
+    )
+    hourly_rate_min: int | None = Field(
+        default=None,
+        description="Minimum hourly rate in USD (only applied when job_type allows hourly).",
+    )
+    hourly_rate_max: int | None = Field(
+        default=None,
+        description="Maximum hourly rate in USD (only applied when job_type allows hourly).",
+    )
+    workload: list[str] | str | None = Field(
+        default=None,
+        description=(
+            "Workload filter. Accepts a single value or list. "
+            "Allowed: 'as_needed' (<30 hrs/wk), 'part_time' (<30 hrs/wk steady), "
+            "'full_time' (30+ hrs/wk)."
+        ),
+    )
+    duration: list[str] | str | None = Field(
+        default=None,
+        description=(
+            "Project duration filter. Accepts a single value or list. "
+            "Allowed: 'week' (<1 month), 'month' (1-3 months), "
+            "'semester' (3-6 months), 'ongoing' (6+ months)."
+        ),
+    )
+    location: list[str] | str | None = Field(
+        default=None,
+        description=(
+            "Client location filter. Accepts a country/region name or list "
+            "(e.g. 'United States', 'Europe', 'United Kingdom')."
+        ),
+    )
+    proposals_max: int | None = Field(
+        default=None,
+        description=(
+            "Maximum proposals tier on the job. Accepts 4, 9, 14, 19 or 49 "
+            "(maps to Upwork's 0-4, 0-9, 0-14, 0-19, 0-49 buckets)."
+        ),
+    )
+    payment_verified: bool | None = Field(
+        default=None,
+        description="If true, restrict to clients with verified payment method.",
+    )
+    contract_to_hire: bool | None = Field(
+        default=None,
+        description="If true, include 'Contract-to-hire' jobs.",
+    )
+    client_hires: str | None = Field(
+        default=None,
+        description=(
+            "Filter by client's prior hire count. Pass Upwork's raw bucket string, "
+            "e.g. '1-9,10-' for 1+ hires."
+        ),
+    )
+    sort: str | None = Field(
+        default=None,
+        description="Sort order. Common: 'recency', 'relevance+desc' (default), 'client_total_charge+desc'.",
+    )
+    feed: bool = Field(
+        default=False,
+        description=(
+            "If true, use the personalised best-matches feed (largely ignores the query). "
+            "If false (default) perform a real keyword search."
+        ),
     )
     limit: int = Field(default=10, ge=1, le=50, description="Maximum number of results")
 
@@ -26,99 +96,294 @@ class JobDetailsParams(BaseModel):
     job_url: str = Field(description="Full Upwork job URL or job ID")
 
 
+_EXP_LEVEL_MAP = {"entry": "1", "intermediate": "2", "expert": "3"}
+_DURATION_MAP = {
+    "week": "week",
+    "month": "month",
+    "semester": "semester",
+    "ongoing": "ongoing",
+    "<1 month": "week",
+    "1-3 months": "month",
+    "3-6 months": "semester",
+    "6+ months": "ongoing",
+}
+_WORKLOAD_MAP = {
+    "as_needed": "as_needed",
+    "as needed": "as_needed",
+    "part_time": "part_time",
+    "part time": "part_time",
+    "full_time": "full_time",
+    "full time": "full_time",
+}
+_PROPOSALS_BUCKETS = {
+    4: "0-4",
+    9: "0-4,5-9",
+    14: "0-4,5-9,10-14",
+    19: "0-4,5-9,10-14,15-19",
+    49: "0-4,5-9,10-14,15-19,20-49",
+}
+
+
+def _as_list(v) -> list[str]:
+    """Normalize a str | list[str] | None to a list of stripped strings."""
+    if v is None:
+        return []
+    if isinstance(v, str):
+        return [v.strip()] if v.strip() else []
+    return [str(x).strip() for x in v if str(x).strip()]
+
+
 async def search_jobs(params: JobSearchParams) -> list[dict]:
     """Search for jobs on Upwork matching the specified criteria.
 
-    Returns a list of job summaries with title, budget, and URL.
+    Returns lightweight job previews including title, url, posted, budget,
+    skills, the client's payment_verified/rating/total_spent/country, AND
+    the proposals_tier bucket Upwork shows on the tile (e.g. "Less than 5",
+    "5 to 10", "10 to 15"). The richer "Activity on this job" block
+    (interviewing count, hires, last_viewed_by_client) still requires
+    get_job_details.
     """
     browser = get_browser()
     page = await browser.get_page()
 
-    # Build search URL
-    base_url = "https://www.upwork.com/nx/find-work/best-matches"
-    query_params = {"q": params.query}
+    # Build search URL.
+    # /nx/search/jobs/ is the real keyword-search endpoint. /find-work/best-matches
+    # is a personalised feed and largely ignores the `q` parameter.
+    if params.feed:
+        base_url = "https://www.upwork.com/nx/find-work/best-matches"
+    else:
+        base_url = "https://www.upwork.com/nx/search/jobs/"
 
+    query_params: list[tuple[str, str]] = [("q", params.query)]
+
+    if params.category:
+        query_params.append(("category", params.category))
+
+    # job_type → t param. Omit to include both (Upwork accepts t=0,1).
     if params.job_type:
-        query_params["t"] = "0" if params.job_type.lower() == "hourly" else "1"
+        jt = params.job_type.lower()
+        if jt == "hourly":
+            query_params.append(("t", "0"))
+        elif jt == "fixed":
+            query_params.append(("t", "1"))
 
-    if params.experience_level:
-        level_map = {"entry": "1", "intermediate": "2", "expert": "3"}
-        level = level_map.get(params.experience_level.lower())
-        if level:
-            query_params["contractor_tier"] = level
+    # Experience level (list allowed). Upwork joins with commas: contractor_tier=1,2,3
+    levels = []
+    for v in _as_list(params.experience_level):
+        mapped = _EXP_LEVEL_MAP.get(v.lower())
+        if mapped:
+            levels.append(mapped)
+    if levels:
+        query_params.append(("contractor_tier", ",".join(levels)))
+
+    # Fixed-price budget. Upwork's `amount` uses bracketed ranges joined
+    # by commas, e.g. amount=0-99,100-499. We expose a simple min/max pair.
+    if params.budget_min is not None or params.budget_max is not None:
+        lo = params.budget_min if params.budget_min is not None else 0
+        hi = params.budget_max if params.budget_max is not None else ""
+        if params.job_type is None or params.job_type.lower() == "fixed":
+            query_params.append(("amount", f"{lo}-{hi}"))
+
+    # Hourly rate range.
+    if params.hourly_rate_min is not None or params.hourly_rate_max is not None:
+        lo = params.hourly_rate_min if params.hourly_rate_min is not None else 0
+        hi = params.hourly_rate_max if params.hourly_rate_max is not None else ""
+        if params.job_type is None or params.job_type.lower() == "hourly":
+            query_params.append(("hourly_rate", f"{lo}-{hi}"))
+
+    # Workload
+    workloads = []
+    for v in _as_list(params.workload):
+        mapped = _WORKLOAD_MAP.get(v.lower())
+        if mapped:
+            workloads.append(mapped)
+    if workloads:
+        query_params.append(("workload", ",".join(workloads)))
+
+    # Duration (Upwork's filter is `duration_v3`)
+    durations = []
+    for v in _as_list(params.duration):
+        mapped = _DURATION_MAP.get(v.lower())
+        if mapped:
+            durations.append(mapped)
+    if durations:
+        query_params.append(("duration_v3", ",".join(durations)))
+
+    # Location (comma-separated list of country / region names)
+    locs = _as_list(params.location)
+    if locs:
+        query_params.append(("location", ",".join(locs)))
+
+    # Proposals bucket
+    if params.proposals_max is not None:
+        bucket = _PROPOSALS_BUCKETS.get(params.proposals_max)
+        if bucket:
+            query_params.append(("proposals", bucket))
+
+    if params.payment_verified:
+        query_params.append(("payment_verified", "1"))
+    if params.contract_to_hire:
+        query_params.append(("contract_to_hire", "true"))
+    if params.client_hires:
+        query_params.append(("client_hires", params.client_hires))
+    if params.sort:
+        query_params.append(("sort", params.sort))
 
     url = f"{base_url}?{urllib.parse.urlencode(query_params)}"
-    await page.goto(url, wait_until="domcontentloaded")
-    await asyncio.sleep(3)
+    # Use `commit` (earliest navigation event) instead of `domcontentloaded`
+    # — heavy Upwork pages can take >30s to fire DOMContentLoaded but the
+    # job tiles hydrate well before that. We rely on wait_for_selector for
+    # the actual data readiness.
+    await page.goto(url, wait_until="commit")
 
-    jobs = []
+    try:
+        await page.wait_for_selector(
+            'article.job-tile [data-test="job-tile-title-link"]',
+            timeout=20000,
+        )
+    except Exception:
+        await asyncio.sleep(3)
 
-    # Get job sections (each section contains one job)
-    sections = await page.query_selector_all("section")
+    jobs: list[dict] = []
+    seen_urls: set[str] = set()
 
-    for section in sections[:params.limit * 2]:  # Check more sections
+    tiles = await page.query_selector_all("article.job-tile")
+
+    for tile in tiles:
+        if len(jobs) >= params.limit:
+            break
         try:
-            job = {}
-
-            # Get title from h3 or h4 link
-            title_link = await section.query_selector("h3 a, h4 a")
-            if not title_link:
+            job = await _extract_job_tile(tile)
+            if not job or job["url"] in seen_urls:
                 continue
-
-            title = await title_link.text_content()
-            href = await title_link.get_attribute("href")
-
-            if not title or not href or "/jobs/" not in href:
-                continue
-
-            job["title"] = title.strip()
-            job["url"] = f"https://www.upwork.com{href}" if href.startswith("/") else href
-
-            # Get description snippet
-            desc_el = await section.query_selector("p, [data-test='job-description-text']")
-            if desc_el:
-                desc = await desc_el.text_content()
-                if desc:
-                    job["description"] = desc.strip()[:300]
-
-            # Get budget/rate info
-            for sel in ["strong", "span"]:
-                els = await section.query_selector_all(sel)
-                for el in els:
-                    text = await el.text_content()
-                    if text and ("$" in text or "hourly" in text.lower() or "fixed" in text.lower()):
-                        job["budget"] = text.strip()
-                        break
-                if "budget" in job:
-                    break
-
-            # Get skills
-            skill_els = await section.query_selector_all("button, [class*='skill'], [class*='token']")
-            skills = []
-            for el in skill_els[:8]:
-                text = await el.text_content()
-                if text and len(text.strip()) > 1 and len(text.strip()) < 30:
-                    skills.append(text.strip())
-            if skills:
-                job["skills"] = skills
-
-            # Get posted time
-            time_els = await section.query_selector_all("span, small")
-            for el in time_els:
-                text = await el.text_content()
-                if text and ("ago" in text.lower() or "posted" in text.lower()):
-                    job["posted"] = text.strip()
-                    break
-
+            seen_urls.add(job["url"])
             jobs.append(job)
-
-            if len(jobs) >= params.limit:
-                break
-
         except Exception:
             continue
 
     return jobs
+
+
+async def _extract_job_tile(tile) -> dict | None:
+    """Extract a single job tile <article.job-tile> into a dict."""
+    # Title link
+    link_el = await tile.query_selector('[data-test="job-tile-title-link"]')
+    if not link_el:
+        return None
+    href = await link_el.get_attribute("href")
+    if not href or "/jobs/" not in href:
+        return None
+
+    # Title — strip the `<span class="highlight">` markers used for search
+    # term highlighting so we get the clean job title.
+    title_html_el = link_el
+    title = await title_html_el.text_content()
+    title = re.sub(r"\s+", " ", (title or "").strip())
+    if not title:
+        return None
+
+    job: dict = {
+        "title": title,
+        # Strip the `?referrer_url_path=/nx/search/jobs/` tracking query.
+        "url": (f"https://www.upwork.com{href}" if href.startswith("/") else href).split("?")[0],
+    }
+
+    # Posted time. `[data-test="job-pubilshed-date"]` (yes, Upwork's typo)
+    # wraps a "Posted yesterday" / "Posted 2 hours ago" text.
+    posted_el = await tile.query_selector('[data-test="job-pubilshed-date"]')
+    if posted_el:
+        posted_text = re.sub(r"\s+", " ", (await posted_el.text_content() or "").strip())
+        posted_text = re.sub(r"^Posted\s+", "", posted_text, flags=re.I)
+        if posted_text:
+            job["posted"] = posted_text
+
+    # Payment verified is a presence flag.
+    if await tile.query_selector('[data-test="payment-verified"]'):
+        job["payment_verified"] = True
+
+    # Rating — read the numeric value from `.air3-rating-value-text`.
+    rating_el = await tile.query_selector(
+        '[data-test="total-feedback"] .air3-rating-value-text'
+    )
+    if rating_el:
+        rating_text = (await rating_el.text_content() or "").strip()
+        try:
+            job["client_rating"] = float(rating_text)
+        except ValueError:
+            pass
+
+    # Total spent — `<strong>$3K+</strong> spent`.
+    spent_el = await tile.query_selector('[data-test="total-spent"] strong')
+    if spent_el:
+        spent = re.sub(r"\s+", " ", (await spent_el.text_content() or "").strip())
+        if spent:
+            job["total_spent"] = spent
+
+    # Client country code (e.g. "DEU", "USA"). The visible label is wrapped
+    # in a span with `sr-only` "Location " prefix — we drop that.
+    loc_el = await tile.query_selector('[data-test="location"] .rr-mask')
+    if loc_el:
+        country = re.sub(r"\s+", " ", (await loc_el.text_content() or "").strip())
+        country = country.replace("Location", "").strip()
+        if country:
+            job["client_country"] = country
+
+    # Job type / budget. `[data-test="job-type-label"]` holds:
+    #   "Fixed price"
+    #   "Hourly: $15.00 - $30.00 "
+    job_type_el = await tile.query_selector('[data-test="job-type-label"]')
+    if job_type_el:
+        job_type_text = re.sub(r"\s+", " ", (await job_type_el.text_content() or "").strip())
+        if job_type_text:
+            job["job_type"] = job_type_text
+            # If it's "Hourly: $X - $Y" pull out the rate range.
+            rate_match = re.search(
+                r"Hourly:\s*\$([\d.,]+)\s*-\s*\$([\d.,]+)", job_type_text, re.I
+            )
+            if rate_match:
+                job["hourly_rate_range"] = f"${rate_match.group(1)} - ${rate_match.group(2)}"
+
+    # Experience level
+    exp_el = await tile.query_selector('[data-test="experience-level"] strong')
+    if exp_el:
+        exp = re.sub(r"\s+", " ", (await exp_el.text_content() or "").strip())
+        if exp:
+            job["experience_level"] = exp
+
+    # Fixed-price budget — "Est. budget: $30.00"
+    fixed_el = await tile.query_selector('[data-test="is-fixed-price"]')
+    if fixed_el:
+        fixed_text = re.sub(r"\s+", " ", (await fixed_el.text_content() or "").strip())
+        budget_match = re.search(r"\$[\d.,]+", fixed_text)
+        if budget_match:
+            job["budget"] = budget_match.group(0)
+
+    # Proposals tier — "Proposals: 5 to 10" / "Less than 5"
+    proposals_el = await tile.query_selector('[data-test="proposals-tier"] strong')
+    if proposals_el:
+        prop = re.sub(r"\s+", " ", (await proposals_el.text_content() or "").strip())
+        if prop:
+            job["proposals_tier"] = prop
+
+    # Description snippet — single <p> inside the line-clamp wrapper.
+    desc_el = await tile.query_selector(
+        '.air3-line-clamp-wrapper.clamp p, .air3-line-clamp.is-clamped p'
+    )
+    if desc_el:
+        desc = re.sub(r"\s+", " ", (await desc_el.text_content() or "").strip())
+        if desc:
+            job["description"] = desc[:500]
+
+    # Skills — `<button data-test="token" class="air3-token"><span class="highlight-color">SKILL</span></button>`
+    skills: list[str] = []
+    for el in await tile.query_selector_all('[data-test="token"]'):
+        text = re.sub(r"\s+", " ", (await el.text_content() or "").strip())
+        if text and text not in skills:
+            skills.append(text)
+    if skills:
+        job["skills"] = skills
+
+    return job
 
 
 async def get_job_details(params: JobDetailsParams) -> dict:
@@ -130,20 +395,35 @@ async def get_job_details(params: JobDetailsParams) -> dict:
     browser = get_browser()
     page = await browser.get_page()
 
-    # Normalize URL
-    url = params.job_url
+    # Normalize URL. We accept four input shapes:
+    #   1. Full canonical URL  https://www.upwork.com/jobs/Slug_~022...../
+    #   2. Search-modal URL    https://www.upwork.com/nx/search/jobs/details/~022....?_modalInfo=...
+    #   3. Raw job id          ~022053317751386536044
+    #   4. Bare path           /jobs/Slug_~022..../
+    url = params.job_url.strip()
     if not url.startswith("http"):
-        url = f"https://www.upwork.com/jobs/{url}"
+        if url.startswith("/"):
+            url = f"https://www.upwork.com{url}"
+        else:
+            url = f"https://www.upwork.com/jobs/{url}"
+    # Strip noisy tracking + modal query params so the page loads as a
+    # standalone job detail rather than as a search overlay (which can
+    # behave inconsistently).
+    url = url.split("?")[0]
+    # Convert the search modal path to the canonical `/jobs/~ID/` form.
+    modal_match = re.search(r"/nx/search/jobs/details/(~0[\dA-Za-z]+)", url)
+    if modal_match:
+        url = f"https://www.upwork.com/jobs/{modal_match.group(1)}/"
 
-    await page.goto(url, wait_until="domcontentloaded")
+    # Use `commit` so we don't block on DOMContentLoaded — heavy Upwork
+    # pages can take >30s to fire that event, but the data we want
+    # hydrates well before then.
+    await page.goto(url, wait_until="commit")
 
-    # Wait for the main job-detail container to actually render — Upwork
-    # populates the SSR'd shell asynchronously. Fall back to a short sleep
-    # if the selector never appears so we still return partial data.
     try:
         await page.wait_for_selector(
             '[data-test="Description"], [data-test="about-client-container"]',
-            timeout=15000,
+            timeout=25000,
         )
     except Exception:
         await asyncio.sleep(3)

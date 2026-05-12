@@ -3,40 +3,34 @@
 import argparse
 import asyncio
 from typing import Annotated
+
 from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
-from .browser.client import get_browser, close_browser, UpworkBrowser
-from .browser.auth import login_interactive, check_session, logout
-from .tools.jobs import JobSearchParams, JobDetailsParams, search_jobs, get_job_details
-from .tools.profile import get_my_profile, get_connects_balance, get_profile_stats
+from .browser.auth import check_session, login_interactive, logout
+from .browser.client import close_browser, get_browser
+from .tools.jobs import (
+    JobDetailsParams,
+    JobSearchParams,
+    get_job_details,
+    search_jobs,
+)
+from .tools.portfolio import PortfolioItemParams, get_portfolio_item
+from .tools.profile import get_connects_balance, get_my_profile
 from .tools.proposals import (
     ProposalsParams,
-    SubmitProposalParams,
-    get_proposals,
     get_proposal_details,
-    submit_proposal,
-    withdraw_proposal,
-)
-from .tools.messages import (
-    MessagesParams,
-    SendMessageParams,
-    get_messages,
-    get_conversation_messages,
-    send_message,
-    get_unread_count,
-)
-from .tools.contracts import (
-    ContractsParams,
-    get_contracts,
-    get_contract_details,
-    get_work_diary,
+    get_proposals,
 )
 
 # Initialize FastMCP server
 mcp = FastMCP(
     name="upwork-mcp",
-    instructions="Upwork MCP Server - Search jobs, manage proposals, messages, and contracts via browser automation",
+    instructions=(
+        "Upwork MCP — job search, job details, proposal list/detail, portfolio "
+        "items, profile, and connects balance. Submit/withdraw proposals and "
+        "all messaging/contract tools are intentionally NOT exposed."
+    ),
 )
 
 
@@ -49,25 +43,122 @@ mcp = FastMCP(
 async def upwork_search_jobs(
     query: Annotated[str, Field(description="Search keywords")],
     category: Annotated[str | None, Field(description="Job category filter")] = None,
-    budget_min: Annotated[int | None, Field(description="Minimum budget in USD")] = None,
-    budget_max: Annotated[int | None, Field(description="Maximum budget in USD")] = None,
+    budget_min: Annotated[int | None, Field(description="Minimum fixed-price budget in USD")] = None,
+    budget_max: Annotated[int | None, Field(description="Maximum fixed-price budget in USD")] = None,
+    hourly_rate_min: Annotated[int | None, Field(description="Minimum hourly rate in USD")] = None,
+    hourly_rate_max: Annotated[int | None, Field(description="Maximum hourly rate in USD")] = None,
     experience_level: Annotated[
-        str | None, Field(description="Experience level: entry, intermediate, or expert")
+        list[str] | str | None,
+        Field(description="Experience filter — one of or list of: entry, intermediate, expert"),
     ] = None,
-    job_type: Annotated[str | None, Field(description="Job type: hourly or fixed")] = None,
+    job_type: Annotated[
+        str | None,
+        Field(description="Job type: 'hourly' or 'fixed'. Omit to include both."),
+    ] = None,
+    workload: Annotated[
+        list[str] | str | None,
+        Field(
+            description=(
+                "Workload filter — one of or list of: 'as_needed' (<30h/wk), "
+                "'part_time', 'full_time' (30+ h/wk)."
+            )
+        ),
+    ] = None,
+    duration: Annotated[
+        list[str] | str | None,
+        Field(
+            description=(
+                "Project duration — one of or list of: 'week' (<1mo), 'month' (1-3mo), "
+                "'semester' (3-6mo), 'ongoing' (6+mo)."
+            )
+        ),
+    ] = None,
+    location: Annotated[
+        list[str] | str | None,
+        Field(
+            description=(
+                "Client location filter, e.g. 'United States', 'Europe', "
+                "'United Kingdom'. Accepts a list."
+            )
+        ),
+    ] = None,
+    proposals_max: Annotated[
+        int | None,
+        Field(
+            description=(
+                "Max proposals tier. Accepts 4, 9, 14, 19 or 49 (maps to "
+                "Upwork's bucketed filter)."
+            )
+        ),
+    ] = None,
+    payment_verified: Annotated[
+        bool | None,
+        Field(description="If true, restrict to clients with verified payment method."),
+    ] = None,
+    contract_to_hire: Annotated[
+        bool | None,
+        Field(description="If true, include contract-to-hire jobs."),
+    ] = None,
+    client_hires: Annotated[
+        str | None,
+        Field(description="Client's prior hire bucket, e.g. '1-9,10-' for 1+ hires."),
+    ] = None,
+    sort: Annotated[
+        str | None,
+        Field(description="Sort order, e.g. 'recency' or 'relevance+desc'."),
+    ] = None,
+    feed: Annotated[
+        bool,
+        Field(
+            description=(
+                "If true, use the personalised best-matches feed (largely ignores the query). "
+                "If false (default) perform a real keyword search at /nx/search/jobs/."
+            )
+        ),
+    ] = False,
     limit: Annotated[int, Field(description="Maximum number of results", ge=1, le=50)] = 20,
 ) -> list[dict]:
-    """Search for jobs on Upwork matching the specified criteria.
+    """Search for jobs on Upwork with rich filters.
 
-    Returns a list of job summaries with title, budget, client info, and URL.
+    Returns lightweight previews. Per-tile fields:
+      - title, url, posted, description, skills
+      - job_type ('Fixed price' or 'Hourly: $X - $Y'),
+        hourly_rate_range (if hourly), budget (if fixed),
+        experience_level
+      - payment_verified, client_rating, total_spent, client_country
+      - proposals_tier (e.g. 'Less than 5', '5 to 10', '10 to 15') —
+        USE THIS to skip saturated jobs before calling get_job_details
+
+    The richer 'Activity on this job' block — interviewing count, hires,
+    last_viewed_by_client, invites_sent, unanswered_invites — is NOT on
+    the tile; only get_job_details returns it. Before recommending or
+    applying to a job, call upwork_get_job_details and reject jobs where:
+      - activity.hires (or 'already_hired') > 0  → someone is already on
+        the contract; new applicants will waste connects
+      - activity.interviewing > 0 AND activity.last_viewed_by_client is
+        recent  → client has shortlisted, not actively reviewing new bids
+      - proposals_tier is 50+ on a small fixed-price job
+
+    Do NOT make a recommendation off the search payload alone.
     """
     params = JobSearchParams(
         query=query,
         category=category,
         budget_min=budget_min,
         budget_max=budget_max,
+        hourly_rate_min=hourly_rate_min,
+        hourly_rate_max=hourly_rate_max,
         experience_level=experience_level,
         job_type=job_type,
+        workload=workload,
+        duration=duration,
+        location=location,
+        proposals_max=proposals_max,
+        payment_verified=payment_verified,
+        contract_to_hire=contract_to_hire,
+        client_hires=client_hires,
+        sort=sort,
+        feed=feed,
         limit=limit,
     )
     return await search_jobs(params)
@@ -75,12 +166,34 @@ async def upwork_search_jobs(
 
 @mcp.tool()
 async def upwork_get_job_details(
-    job_url: Annotated[str, Field(description="Full Upwork job URL or job ID")]
+    job_url: Annotated[
+        str,
+        Field(
+            description=(
+                "Full Upwork job URL, raw job id (e.g. ~022...), or the "
+                "search-modal URL (/nx/search/jobs/details/~ID?...). "
+                "Modal URLs are auto-canonicalised."
+            )
+        ),
+    ]
 ) -> dict:
     """Get detailed information about a specific Upwork job posting.
 
-    Returns comprehensive job details including description, client history,
-    skills required, and application requirements.
+    Returns:
+      - title, description, posted, job_type, workload, duration,
+        experience_level, project_type, skills
+      - bid_range: {high, avg, low} — actual freelancer bids on this job
+      - activity: proposals, interviewing, invites_sent, unanswered_invites,
+        hires, last_viewed_by_client — USE THESE before recommending
+      - client: country, city, payment_verified, phone_verified, rating,
+        total_spent, hires (total + active), avg_hourly_rate_paid (what
+        this client actually pays per hour), total_hours_billed,
+        member_since, job_posting_stats (jobs_posted + hire_rate_pct)
+      - connects_required, available_connects
+
+    Quote returned values VERBATIM when presenting them to the user — do
+    not round bid_range averages, do not invent total_spent, do not
+    paraphrase client.member_since dates.
     """
     params = JobDetailsParams(job_url=job_url)
     return await get_job_details(params)
@@ -93,10 +206,11 @@ async def upwork_get_job_details(
 
 @mcp.tool()
 async def upwork_get_my_profile() -> dict:
-    """Get your Upwork freelancer profile information.
+    """Fetch your Upwork freelancer profile.
 
-    Returns profile data including name, title, hourly rate, JSS score,
-    availability status, and skill tags.
+    Returns name, professional_title, hourly_rate, city, country, connects,
+    and the page document title. Fields that aren't rendered on the page
+    are omitted; don't infer missing values.
     """
     return await get_my_profile()
 
@@ -105,179 +219,104 @@ async def upwork_get_my_profile() -> dict:
 async def upwork_get_connects_balance() -> dict:
     """Get current Upwork Connects balance.
 
-    Returns the number of available connects.
+    Returns {available: int, available_label: str}.
     """
     return await get_connects_balance()
 
 
-@mcp.tool()
-async def upwork_get_profile_stats() -> dict:
-    """Get profile statistics including earnings and work history.
+# ============================================================================
+# Portfolio Tools
+# ============================================================================
 
-    Returns stats like total earnings, hours worked, jobs completed.
+
+@mcp.tool()
+async def upwork_get_portfolio_item(
+    url: Annotated[
+        str,
+        Field(
+            description=(
+                "Full portfolio modal URL "
+                "(https://www.upwork.com/freelancers/~01...?p=<project_id>) "
+                "or a raw numeric project id (paired with freelancer_url)."
+            )
+        ),
+    ],
+    freelancer_url: Annotated[
+        str | None,
+        Field(
+            description=(
+                "Optional freelancer profile URL to combine with a raw project id."
+            )
+        ),
+    ] = None,
+) -> dict:
+    """Read one Upwork portfolio item (case study) from the freelancer
+    profile modal at `?p=<id>`.
+
+    Returns:
+      title, role, description, skills (list), published (date),
+      images (list of URLs), links (list of URLs).
     """
-    return await get_profile_stats()
+    params = PortfolioItemParams(url=url, freelancer_url=freelancer_url)
+    return await get_portfolio_item(params)
 
 
 # ============================================================================
-# Proposal Tools
+# Proposal Tools (read-only — submit/withdraw are intentionally NOT exposed)
 # ============================================================================
 
 
 @mcp.tool()
 async def upwork_get_proposals(
-    status: Annotated[
-        str, Field(description="Filter by status: active, submitted, archived, or all")
+    tab: Annotated[
+        str,
+        Field(description="One of 'active' (default), 'archived', 'referrals'."),
     ] = "active",
-    limit: Annotated[int, Field(description="Maximum number of results", ge=1, le=50)] = 20,
-) -> list[dict]:
-    """Get your submitted proposals on Upwork.
+    limit: Annotated[
+        int, Field(description="Maximum rows per section", ge=1, le=100)
+    ] = 20,
+) -> dict:
+    """List your proposals from /nx/proposals/.
 
-    Returns a list of proposals with job title, status, bid amount, and dates.
+    Returns a dict shaped:
+      {
+        "tab": "active",
+        "sections": {
+          "offers": {"count": int, "items": [...]},
+          "invites_from_clients": {"count": int, "items": [...]},
+          "active_proposals": {"count": int, "items": [...]},
+          "submitted_proposals": {"count": int, "items": [...]},
+        }
+      }
+
+    Each item has job_title, url (link to /nx/proposals/<id>), initiated,
+    initiated_relative, profile. Use the url with upwork_get_proposal_details.
     """
-    params = ProposalsParams(status=status, limit=limit)
+    params = ProposalsParams(tab=tab, limit=limit)
     return await get_proposals(params)
 
 
 @mcp.tool()
 async def upwork_get_proposal_details(
-    proposal_url: Annotated[str, Field(description="URL to the proposal")]
+    proposal_url: Annotated[
+        str,
+        Field(
+            description=(
+                "Full /nx/proposals/<id> URL or just the numeric id."
+            )
+        ),
+    ]
 ) -> dict:
-    """Get detailed information about a specific proposal.
+    """Get details of a single submitted proposal.
 
-    Returns details including cover letter, bid, and any messages.
+    Returns the proposal record with the original job's title/description/
+    posted/category/features/skills, the freelancer's proposed terms
+    (hourly rate or fixed bid, you-receive amount, rate-increase),
+    the cover letter, the profile highlights attached to the proposal,
+    a snapshot of the client block, and is_editable (true while the
+    proposal is still live in /nx/proposals/<id>).
     """
     return await get_proposal_details(proposal_url)
-
-
-@mcp.tool()
-async def upwork_submit_proposal(
-    job_url: Annotated[str, Field(description="Full Upwork job URL")],
-    cover_letter: Annotated[str, Field(description="Cover letter content")],
-    rate: Annotated[float | None, Field(description="Proposed hourly rate (for hourly jobs)")] = None,
-    bid: Annotated[float | None, Field(description="Bid amount (for fixed-price jobs)")] = None,
-    answers: Annotated[list[str] | None, Field(description="Answers to screening questions")] = None,
-) -> dict:
-    """Submit a proposal to an Upwork job.
-
-    IMPORTANT: This is a sensitive action that will spend Connects.
-    Make sure the cover letter and rate/bid are correct before submitting.
-
-    Returns submission status and connects used.
-    """
-    params = SubmitProposalParams(
-        job_url=job_url,
-        cover_letter=cover_letter,
-        rate=rate,
-        bid=bid,
-        answers=answers,
-    )
-    return await submit_proposal(params)
-
-
-@mcp.tool()
-async def upwork_withdraw_proposal(
-    proposal_url: Annotated[str, Field(description="URL to the proposal to withdraw")]
-) -> dict:
-    """Withdraw a submitted proposal.
-
-    Returns withdrawal status.
-    """
-    return await withdraw_proposal(proposal_url)
-
-
-# ============================================================================
-# Message Tools
-# ============================================================================
-
-
-@mcp.tool()
-async def upwork_get_messages(
-    room_id: Annotated[str | None, Field(description="Specific chat room ID or URL")] = None,
-    unread_only: Annotated[bool, Field(description="Only show unread messages")] = False,
-    limit: Annotated[int, Field(description="Maximum conversations to return", ge=1, le=50)] = 20,
-) -> list[dict]:
-    """Get messages from Upwork inbox.
-
-    Returns a list of conversations with last message, sender info, and unread status.
-    """
-    params = MessagesParams(room_id=room_id, unread_only=unread_only, limit=limit)
-    return await get_messages(params)
-
-
-@mcp.tool()
-async def upwork_get_conversation(
-    room_id: Annotated[str, Field(description="Chat room ID or URL")],
-    limit: Annotated[int, Field(description="Maximum messages to return", ge=1, le=100)] = 50,
-) -> dict:
-    """Get all messages in a specific conversation.
-
-    Returns conversation details with full message history.
-    """
-    return await get_conversation_messages(room_id, limit)
-
-
-@mcp.tool()
-async def upwork_send_message(
-    room_id: Annotated[str, Field(description="Chat room ID or URL")],
-    message: Annotated[str, Field(description="Message content to send")],
-) -> dict:
-    """Send a message in an Upwork conversation.
-
-    Returns send status.
-    """
-    params = SendMessageParams(room_id=room_id, message=message)
-    return await send_message(params)
-
-
-@mcp.tool()
-async def upwork_get_unread_count() -> dict:
-    """Get count of unread messages.
-
-    Returns total unread message count.
-    """
-    return await get_unread_count()
-
-
-# ============================================================================
-# Contract Tools
-# ============================================================================
-
-
-@mcp.tool()
-async def upwork_get_contracts(
-    status: Annotated[str, Field(description="Filter by status: active, ended, or all")] = "active",
-    limit: Annotated[int, Field(description="Maximum number of results", ge=1, le=50)] = 20,
-) -> list[dict]:
-    """Get your Upwork contracts.
-
-    Returns a list of contracts with client name, job title, status, and earnings.
-    """
-    params = ContractsParams(status=status, limit=limit)
-    return await get_contracts(params)
-
-
-@mcp.tool()
-async def upwork_get_contract_details(
-    contract_url: Annotated[str, Field(description="URL to the contract")]
-) -> dict:
-    """Get detailed information about a specific contract.
-
-    Returns full contract details including milestones, hours logged, and feedback.
-    """
-    return await get_contract_details(contract_url)
-
-
-@mcp.tool()
-async def upwork_get_work_diary(
-    contract_url: Annotated[str, Field(description="URL to the contract")],
-    week_offset: Annotated[int, Field(description="0 for current week, 1 for last week, etc.")] = 0,
-) -> dict:
-    """Get work diary entries for a contract.
-
-    Returns work diary with daily hours and earnings.
-    """
-    return await get_work_diary(contract_url, week_offset)
 
 
 # ============================================================================
@@ -287,17 +326,18 @@ async def upwork_get_work_diary(
 
 @mcp.tool()
 async def upwork_check_session() -> dict:
-    """Check if the current Upwork session is valid.
-
-    Returns session status and whether re-login is needed.
-    """
+    """Check if the current Upwork session is valid."""
     browser = get_browser()
     try:
         await browser.start()
         logged_in = await browser.is_logged_in()
         return {
             "logged_in": logged_in,
-            "message": "Session is valid" if logged_in else "Session expired. Run 'uvx upwork-mcp --login' to authenticate.",
+            "message": (
+                "Session is valid"
+                if logged_in
+                else "Session expired. Run 'uv run upwork-mcp --login' to authenticate."
+            ),
         }
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
@@ -305,10 +345,7 @@ async def upwork_check_session() -> dict:
 
 @mcp.tool()
 async def upwork_close_session() -> dict:
-    """Close browser session and cleanup resources.
-
-    Call this when you're done using Upwork tools to free up resources.
-    """
+    """Close browser session and cleanup resources."""
     await close_browser()
     return {"status": "closed", "message": "Browser session closed successfully"}
 
@@ -378,7 +415,7 @@ Examples:
                 print("✓ Session is valid")
             else:
                 print("✗ Session expired or invalid")
-                print("  Run 'uvx upwork-mcp --login' to authenticate")
+                print("  Run 'uv run upwork-mcp --login' to authenticate")
 
         asyncio.run(check())
         return
@@ -388,7 +425,7 @@ Examples:
         return
 
     # Initialize browser with settings
-    browser = get_browser(
+    get_browser(
         headless=not args.no_headless,
         timeout=args.timeout,
     )

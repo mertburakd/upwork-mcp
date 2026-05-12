@@ -1,119 +1,159 @@
 """Profile and connects tools for Upwork MCP."""
 
+import asyncio
+import re
+
 from ..browser.client import get_browser
 
 
 async def get_my_profile() -> dict:
-    """Get your Upwork freelancer profile information.
+    """Fetch your Upwork freelancer profile.
 
-    Returns profile data including name, title, hourly rate, JSS score,
-    availability status, and skill tags.
+    Navigates to your *public* profile page (`/freelancers/~01...`) — not
+    the editor settings page — because that's where Upwork renders the
+    structured identity block we can scrape reliably. We resolve the
+    public-profile URL by first hitting `/freelancers/settings/profile`
+    and following the avatar link in the global navbar.
+
+    Returns whichever of these fields are present in the rendered DOM:
+      name, professional_title, hourly_rate, city, country, connects,
+      page_title.
     """
     browser = get_browser()
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    await page.goto("https://www.upwork.com/freelancers/settings/profile", wait_until="domcontentloaded")
+    # Step 1 — load the settings page so we can grab the avatar's link to
+    # the public profile. The settings page itself doesn't render the
+    # structured identity block.
+    await page.goto(
+        "https://www.upwork.com/freelancers/settings/profile",
+        wait_until="commit",
+    )
+    try:
+        await page.wait_for_selector('a[href^="/freelancers/~"]', timeout=20000)
+    except Exception:
+        await asyncio.sleep(2)
 
-    profile = {}
+    public_href = None
+    for a in await page.query_selector_all('a[href^="/freelancers/~"]'):
+        href = await a.get_attribute("href")
+        if not href:
+            continue
+        # Skip portfolio modal links (those carry `?p=...`) and settings links.
+        if "settings" in href or "?p=" in href:
+            continue
+        public_href = href.split("?")[0]
+        break
 
-    # Name
-    name_el = await page.query_selector('[data-test="profile-name"], h1, .profile-name')
+    if public_href:
+        public_url = f"https://www.upwork.com{public_href}"
+        await page.goto(public_url, wait_until="commit")
+        try:
+            await page.wait_for_selector('h2[itemprop="name"]', timeout=25000)
+        except Exception:
+            await asyncio.sleep(3)
+    # If we couldn't find a public-profile link, fall through and try to
+    # extract whatever we can from the settings page DOM.
+
+    profile: dict = {}
+
+    # Document title — on the public profile page, this is the headline
+    # ("Mert Burak D. - Senior Full Stack Developer | … - Upwork Freelancer
+    # from Aydin, Turkey").
+    doc_title = (await page.title() or "").strip()
+    if doc_title:
+        profile["page_title"] = doc_title
+    if public_href:
+        profile["profile_url"] = f"https://www.upwork.com{public_href}"
+
+    # Name (schema.org itemprop)
+    name_el = await page.query_selector('h2[itemprop="name"]')
     if name_el:
-        profile["name"] = (await name_el.text_content() or "").strip()
+        name = re.sub(r"\s+", " ", (await name_el.text_content() or "").strip())
+        if name:
+            profile["name"] = name
 
-    # Professional title
-    title_el = await page.query_selector('[data-test="profile-title"], .profile-title, [data-cy="title"]')
+    # Location
+    city_el = await page.query_selector('span[itemprop="locality"]')
+    if city_el:
+        profile["city"] = re.sub(r"\s+", " ", (await city_el.text_content() or "").strip())
+    country_el = await page.query_selector('span[itemprop="country-name"]')
+    if country_el:
+        profile["country"] = re.sub(r"\s+", " ", (await country_el.text_content() or "").strip())
+
+    # Professional title — sits in the same identity card as the hourly
+    # rate. The first `h3.h4` inside the identity card is the title.
+    title_el = await page.query_selector(".identity-content h3.h4, h3.h4")
     if title_el:
-        profile["title"] = (await title_el.text_content() or "").strip()
+        title = re.sub(r"\s+", " ", (await title_el.text_content() or "").strip())
+        # Strip the "Edit title" sr-only fragment if the button leaked into
+        # text_content.
+        title = re.sub(r"\s*Edit title$", "", title, flags=re.I)
+        if title:
+            profile["professional_title"] = title
 
-    # Hourly rate
-    rate_el = await page.query_selector('[data-test="hourly-rate"], .hourly-rate, [data-cy="rate"]')
-    if rate_el:
-        profile["hourly_rate"] = (await rate_el.text_content() or "").strip()
+    # Hourly rate — search the whole document for the first `$N/hr` token.
+    # The profile page has at most one rate; ranges live on job tiles.
+    body_text = await page.content()
+    rate_match = re.search(r"\$\d+(?:\.\d{1,2})?/hr", body_text)
+    if rate_match:
+        profile["hourly_rate"] = rate_match.group(0)
 
-    # Profile overview/bio
-    overview_el = await page.query_selector('[data-test="profile-overview"], .profile-overview, [data-cy="overview"]')
-    if overview_el:
-        profile["overview"] = (await overview_el.text_content() or "").strip()
-
-    # Skills
-    skill_els = await page.query_selector_all('[data-test="skill"], .skill-badge, .air3-token')
-    profile["skills"] = []
-    for el in skill_els:
-        text = await el.text_content()
-        if text:
-            profile["skills"].append(text.strip())
-
-    # Now get stats from a different page
-    await page.goto("https://www.upwork.com/nx/find-work/best-matches", wait_until="domcontentloaded")
-
-    # Try to get JSS from sidebar or header
-    jss_el = await page.query_selector('[data-test="jss"], .jss-score, [data-cy="jss"]')
-    if jss_el:
-        profile["job_success_score"] = (await jss_el.text_content() or "").strip()
-
-    # Availability badge
-    avail_el = await page.query_selector('[data-test="availability"], .availability-badge')
-    if avail_el:
-        profile["availability"] = (await avail_el.text_content() or "").strip()
-
-    # Profile completeness
-    complete_el = await page.query_selector('[data-test="profile-completeness"], .profile-complete')
-    if complete_el:
-        profile["profile_completeness"] = (await complete_el.text_content() or "").strip()
-
-    # Get connects balance
-    connects = await get_connects_balance()
-    profile["connects"] = connects
+    # Connects from the sidebar widget — saves a separate page load.
+    connects_el = await page.query_selector(
+        '[data-test="sidebar-connects-card"] h3, [data-test="sidebar-connects-card"] h5'
+    )
+    if connects_el:
+        connects_text = re.sub(r"\s+", " ", (await connects_el.text_content() or "").strip())
+        if connects_text:
+            profile["connects_label"] = connects_text  # "Connects: 48"
+            m = re.search(r"(\d+)", connects_text)
+            if m:
+                profile["connects"] = int(m.group(1))
 
     return profile
 
 
 async def get_connects_balance() -> dict:
-    """Get current Upwork Connects balance and usage.
+    """Get current Upwork Connects balance.
 
-    Returns the number of available connects, pending connects,
-    and connects balance details.
+    Returns a dict with the integer balance under `available` and the raw
+    label text under `available_label` (e.g. "48 Connects").
     """
     browser = get_browser()
     await browser.ensure_logged_in()
     page = await browser.get_page()
 
-    # Navigate to connects page
-    await page.goto("https://www.upwork.com/nx/plans/connects/balance", wait_until="domcontentloaded")
+    # Connects page. The old `/balance` endpoint 404s; the live one is
+    # `/history/`. The page is heavy and `domcontentloaded` regularly
+    # doesn't fire within 30s on a CDP-attached tab — use `commit` and
+    # wait for the balance card explicitly.
+    await page.goto(
+        "https://www.upwork.com/nx/plans/connects/history/",
+        wait_until="commit",
+    )
 
-    connects = {}
+    try:
+        await page.wait_for_selector(".connects-history h2.h3", timeout=25000)
+    except Exception:
+        await asyncio.sleep(2)
 
-    # Available connects
-    available_el = await page.query_selector('[data-test="connects-available"], .connects-balance, [data-cy="available-connects"]')
-    if available_el:
-        text = (await available_el.text_content() or "").strip()
-        # Extract number
-        import re
-        numbers = re.findall(r'\d+', text)
-        if numbers:
-            connects["available"] = int(numbers[0])
+    connects: dict = {}
 
-    # If we couldn't find it, try the header/sidebar on main page
-    if "available" not in connects:
-        await page.goto("https://www.upwork.com/nx/find-work/", wait_until="domcontentloaded")
-        connects_el = await page.query_selector('[data-test="connects-count"], .connects-count')
-        if connects_el:
-            text = (await connects_el.text_content() or "").strip()
-            import re
-            numbers = re.findall(r'\d+', text)
-            if numbers:
-                connects["available"] = int(numbers[0])
+    balance_el = await page.query_selector(".connects-history h2.h3")
+    if balance_el:
+        text = re.sub(r"\s+", " ", (await balance_el.text_content() or "").strip())
+        if text:
+            connects["available_label"] = text  # "48 Connects"
+            m = re.search(r"(\d+)", text)
+            if m:
+                connects["available"] = int(m.group(1))
 
-    # Try to get additional connects info
-    pending_el = await page.query_selector('[data-test="pending-connects"]')
-    if pending_el:
-        text = (await pending_el.text_content() or "").strip()
-        import re
-        numbers = re.findall(r'\d+', text)
-        if numbers:
-            connects["pending"] = int(numbers[0])
+    # "Buy Connects" button is a sanity check that we're on the right page.
+    if not connects:
+        # Page changed shape — surface the page title so the caller can debug.
+        connects["error"] = f"Balance not found on page (title: {await page.title()!r})"
 
     return connects
 
