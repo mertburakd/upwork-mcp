@@ -237,8 +237,13 @@ async def search_jobs(params: JobSearchParams) -> list[dict]:
     await page.goto(url, wait_until="commit")
 
     try:
+        # Upwork now ships the title link as `data-test="job-tile-title-link UpLink"`
+        # (space-separated multi-value). Use the tilde-equal operator so we
+        # match whether or not the trailing "UpLink" token is present — that
+        # future-proofs the selector against Upwork adding/removing more
+        # tokens in the same attribute.
         await page.wait_for_selector(
-            'article.job-tile [data-test="job-tile-title-link"]',
+            'article.job-tile [data-test~="job-tile-title-link"]',
             timeout=20000,
         )
     except Exception:
@@ -261,13 +266,41 @@ async def search_jobs(params: JobSearchParams) -> list[dict]:
         except Exception:
             continue
 
+    # --- TEMPORARY DEBUG when no results came back ----------------------
+    # If we have zero results, return a single synthetic row with the
+    # state of the page so we can diagnose. Keeps the return type
+    # `list[dict]` as advertised.
+    if not jobs:
+        try:
+            dbg = await page.evaluate(
+                """() => ({
+                    nav_url: location.href,
+                    page_title: document.title,
+                    body_len: document.body ? document.body.innerHTML.length : 0,
+                    article_count: document.querySelectorAll('article').length,
+                    job_tile_count: document.querySelectorAll('article.job-tile').length,
+                    tile_link_count: document.querySelectorAll('[data-test="job-tile-title-link"]').length,
+                    has_login_form: !!document.querySelector('input[name="login_password"], #login_username'),
+                    has_cloudflare: !!document.querySelector('#challenge-form, .cf-challenge'),
+                    first_h1: document.querySelector('h1')?.textContent?.trim().slice(0, 100),
+                })"""
+            )
+            return [{"_debug_empty_results": dbg}]
+        except Exception as e:
+            return [{"_debug_empty_results": {"error": str(e)}}]
+    # --------------------------------------------------------------------
+
     return jobs
 
 
 async def _extract_job_tile(tile) -> dict | None:
     """Extract a single job tile <article.job-tile> into a dict."""
-    # Title link
-    link_el = await tile.query_selector('[data-test="job-tile-title-link"]')
+    # Title link. `data-test` is now a multi-value attribute on this anchor
+    # (e.g. "job-tile-title-link UpLink"). Use `~=` to match the token,
+    # falling back to a substring match for safety.
+    link_el = await tile.query_selector(
+        '[data-test~="job-tile-title-link"], [data-test*="job-tile-title-link"]'
+    )
     if not link_el:
         return None
     href = await link_el.get_attribute("href")
@@ -395,27 +428,25 @@ async def get_job_details(params: JobDetailsParams) -> dict:
     browser = get_browser()
     page = await browser.get_page()
 
-    # Normalize URL. We accept four input shapes:
+    # Normalize URL. We accept these input shapes:
     #   1. Full canonical URL  https://www.upwork.com/jobs/Slug_~022...../
     #   2. Search-modal URL    https://www.upwork.com/nx/search/jobs/details/~022....?_modalInfo=...
-    #   3. Raw job id          ~022053317751386536044
-    #   4. Bare path           /jobs/Slug_~022..../
+    #   3. Detail-viewer URL   https://www.upwork.com/nx/s/job-details-viewer/jobs/~022....
+    #   4. Raw job id          ~022053317751386536044
+    #   5. Bare path           /jobs/Slug_~022..../
     #
-    # Important: Upwork ships TWO different layouts for the same job. The
-    # standalone `/jobs/~ID/` page is a NEW redesign that ships description
-    # under `.job-description-content` and drops the `data-test="Description"`
-    # / `[data-test="about-client-container"]` hooks we depend on. The
-    # modal-style URL `/nx/search/jobs/details/~ID` still renders the OLD
-    # layout that exposes those data-test attributes — every selector in
-    # this file is built against that layout. So whatever URL we receive,
-    # we extract the `~ID` token and navigate to the modal route.
+    # We always rewrite to the job-details-viewer route — that's the URL
+    # Upwork actually uses to render the full standalone detail card with
+    # the legacy `data-test` attributes our selectors target. The older
+    # `/jobs/~ID/` and `/nx/search/jobs/details/~ID` paths render either
+    # a stripped-down redesign or a feed fallback.
     raw = params.job_url.strip()
     id_match = re.search(r"(~0[\dA-Za-z]+)", raw)
     if id_match:
-        url = f"https://www.upwork.com/nx/search/jobs/details/{id_match.group(1)}"
+        url = (
+            f"https://www.upwork.com/nx/s/job-details-viewer/jobs/{id_match.group(1)}"
+        )
     else:
-        # Fallback — couldn't find an id, hand the raw URL to the browser
-        # and let it resolve. Likely a 404 but at least it's deterministic.
         if raw.startswith("http"):
             url = raw
         elif raw.startswith("/"):
@@ -450,6 +481,32 @@ async def get_job_details(params: JobDetailsParams) -> dict:
         await asyncio.sleep(2)
 
     job = {"url": url}
+
+    # --- TEMPORARY DEBUG (will be removed once stable) ------------------
+    try:
+        debug = await page.evaluate(
+            """() => {
+                const dt = new Set();
+                document.querySelectorAll('[data-test]').forEach(el => {
+                    dt.add(el.getAttribute('data-test'));
+                });
+                return {
+                    nav_url: location.href,
+                    page_title: document.title,
+                    body_len: document.body ? document.body.innerHTML.length : 0,
+                    has_description_dt: !!document.querySelector('[data-test="Description"]'),
+                    has_jdc: !!document.querySelector('.job-description-content'),
+                    has_about_client: !!document.querySelector('[data-test="about-client-container"]'),
+                    has_apply_btn: !!document.querySelector('#submit-proposal-button'),
+                    h4_text: document.querySelector('h4 .flex-1')?.textContent?.trim().slice(0,80),
+                    data_tests_sample: [...dt].sort().slice(0, 40),
+                };
+            }"""
+        )
+        job["_debug"] = debug
+    except Exception as e:
+        job["_debug"] = {"error": str(e)}
+    # --------------------------------------------------------------------
 
     # Title — Upwork uses <h4> for the job title, not h1/h2. Fall back to
     # the document <title> if the h4 isn't found.
