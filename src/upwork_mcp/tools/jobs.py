@@ -400,33 +400,54 @@ async def get_job_details(params: JobDetailsParams) -> dict:
     #   2. Search-modal URL    https://www.upwork.com/nx/search/jobs/details/~022....?_modalInfo=...
     #   3. Raw job id          ~022053317751386536044
     #   4. Bare path           /jobs/Slug_~022..../
-    url = params.job_url.strip()
-    if not url.startswith("http"):
-        if url.startswith("/"):
-            url = f"https://www.upwork.com{url}"
+    #
+    # Important: Upwork ships TWO different layouts for the same job. The
+    # standalone `/jobs/~ID/` page is a NEW redesign that ships description
+    # under `.job-description-content` and drops the `data-test="Description"`
+    # / `[data-test="about-client-container"]` hooks we depend on. The
+    # modal-style URL `/nx/search/jobs/details/~ID` still renders the OLD
+    # layout that exposes those data-test attributes — every selector in
+    # this file is built against that layout. So whatever URL we receive,
+    # we extract the `~ID` token and navigate to the modal route.
+    raw = params.job_url.strip()
+    id_match = re.search(r"(~0[\dA-Za-z]+)", raw)
+    if id_match:
+        url = f"https://www.upwork.com/nx/search/jobs/details/{id_match.group(1)}"
+    else:
+        # Fallback — couldn't find an id, hand the raw URL to the browser
+        # and let it resolve. Likely a 404 but at least it's deterministic.
+        if raw.startswith("http"):
+            url = raw
+        elif raw.startswith("/"):
+            url = f"https://www.upwork.com{raw}"
         else:
-            url = f"https://www.upwork.com/jobs/{url}"
-    # Strip noisy tracking + modal query params so the page loads as a
-    # standalone job detail rather than as a search overlay (which can
-    # behave inconsistently).
+            url = f"https://www.upwork.com/jobs/{raw}"
     url = url.split("?")[0]
-    # Convert the search modal path to the canonical `/jobs/~ID/` form.
-    modal_match = re.search(r"/nx/search/jobs/details/(~0[\dA-Za-z]+)", url)
-    if modal_match:
-        url = f"https://www.upwork.com/jobs/{modal_match.group(1)}/"
 
     # Use `commit` so we don't block on DOMContentLoaded — heavy Upwork
     # pages can take >30s to fire that event, but the data we want
     # hydrates well before then.
     await page.goto(url, wait_until="commit")
 
+    # The job detail page hydrates progressively: <h4> title and the
+    # `.segmentations` row appear early (server-rendered), while the
+    # `[data-test="Description"]` body, `about-client-container` sidebar
+    # and `.client-activity-items` block come in with a later Vue render.
+    # `#submit-proposal-button` is the stable end-of-hydration signal —
+    # the Apply button only mounts once the full detail card is built.
+    # We wait for it, then wait specifically for the Description before
+    # giving up, then sleep as a last-resort fallback.
     try:
         await page.wait_for_selector(
-            '[data-test="Description"], [data-test="about-client-container"]',
-            timeout=25000,
+            '#submit-proposal-button, [data-test="about-client-container"]',
+            timeout=40000,
         )
     except Exception:
-        await asyncio.sleep(3)
+        pass
+    try:
+        await page.wait_for_selector('[data-test="Description"]', timeout=10000)
+    except Exception:
+        await asyncio.sleep(2)
 
     job = {"url": url}
 
